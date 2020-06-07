@@ -26,6 +26,7 @@ module ocn_vmix
    use mpas_pool_routines
    use mpas_timer
 
+   use mpas_constants
    use ocn_constants
    use ocn_vmix_coefs_const
    use ocn_vmix_coefs_tanh
@@ -67,6 +68,8 @@ module ocn_vmix
 
    logical :: velVmixOn, tracerVmixOn
    real (kind=RKIND) :: implicitBottomDragCoef
+   real (kind=RKIND) :: rayleighDampingCoef, rayleighBottomDampingCoef, &
+                        rayleighDepthVariable
 
 !***********************************************************************
 
@@ -187,6 +190,158 @@ contains
 
 !***********************************************************************
 !
+!  routine ocn_vel_vmix_tend_implicit_rayleigh
+!
+!> \brief   Computes tendencies for implicit momentum vertical mixing
+!> \author  Mark Petersen, Phillip J. Wolfram
+!> \date    September 2011, July 2019
+!> \details
+!>  This routine computes the tendencies for implicit vertical mixing for momentum
+!>  using computed coefficients and includes implicit rayleigh drag.
+!
+!-----------------------------------------------------------------------
+
+   subroutine ocn_vel_vmix_tend_implicit_rayleigh(meshPool, dt, kineticEnergyCell, vertViscTopOfEdge, layerThickness, & !{{{
+                                         layerThicknessEdge, normalVelocity, err)
+
+      !-----------------------------------------------------------------
+      !
+      ! input variables
+      !
+      !-----------------------------------------------------------------
+
+      type (mpas_pool_type), intent(in) :: &
+         meshPool          !< Input: mesh information
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         kineticEnergyCell        !< Input: kinetic energy at cell
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         vertViscTopOfEdge !< Input: vertical mixing coefficients
+
+      real (kind=RKIND), intent(in) :: &
+         dt            !< Input: time step
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         layerThickness !< Input: thickness at cell center
+
+      !-----------------------------------------------------------------
+      !
+      ! input/output variables
+      !
+      !-----------------------------------------------------------------
+
+      real (kind=RKIND), dimension(:,:), intent(inout) :: &
+         normalVelocity             !< Input: velocity
+
+      real (kind=RKIND), dimension(:,:), intent(inout) :: &
+         layerThicknessEdge        !< Input: thickness at edge
+
+      !-----------------------------------------------------------------
+      !
+      ! output variables
+      !
+      !-----------------------------------------------------------------
+
+      integer, intent(out) :: err !< Output: error flag
+
+      !-----------------------------------------------------------------
+      !
+      ! local variables
+      !
+      !-----------------------------------------------------------------
+
+      integer :: iEdge, k, cell1, cell2, N, nEdges
+      integer, pointer :: nVertLevels
+      integer, dimension(:), pointer :: nEdgesArray
+
+      integer, dimension(:), pointer :: maxLevelEdgeTop
+
+      integer, dimension(:,:), pointer :: cellsOnEdge
+
+      real (kind=RKIND), dimension(:), allocatable :: A, B, C, velTemp
+      real (kind=RKIND) :: edgeThicknessTotal
+
+      err = 0
+
+      if(.not.velVmixOn) return
+
+      call mpas_pool_get_dimension(meshPool, 'nEdgesArray', nEdgesArray)
+      call mpas_pool_get_dimension(meshPool, 'nVertLevels', nVertLevels)
+
+      call mpas_pool_get_array(meshPool, 'maxLevelEdgeTop', maxLevelEdgeTop)
+      call mpas_pool_get_array(meshPool, 'cellsOnEdge', cellsOnEdge)
+
+      nEdges = nEdgesArray( 1 )
+
+      allocate(A(nVertLevels),B(nVertLevels),C(nVertLevels),velTemp(nVertLevels))
+      A(1)=0.0_RKIND
+
+      !$omp do schedule(runtime)
+      do iEdge = 1, nEdges
+        N = maxLevelEdgeTop(iEdge)
+        if (N .gt. 0) then
+
+         ! Compute A(k), B(k), C(k)
+         ! layerThicknessEdge is computed in compute_solve_diag, and is not available yet,
+         ! so recompute layerThicknessEdge here.
+         cell1 = cellsOnEdge(1,iEdge)
+         cell2 = cellsOnEdge(2,iEdge)
+         edgeThicknessTotal = 0.0_RKIND
+         do k = 1, N
+            layerThicknessEdge(k,iEdge) = 0.5_RKIND * (layerThickness(k,cell1) + layerThickness(k,cell2))
+            edgeThicknessTotal = edgeThicknessTotal + layerThicknessEdge(k,iEdge)
+         end do
+
+         ! A is lower diagonal term
+         do k = 2, N
+            A(k) = -2.0_RKIND*dt*vertViscTopOfEdge(k,iEdge) &
+               / (layerThicknessEdge(k-1,iEdge) + layerThicknessEdge(k,iEdge)) &
+               / layerThicknessEdge(k,iEdge)
+         enddo
+
+         ! C is upper diagonal term
+         do k = 1, N-1
+            C(k) = -2.0_RKIND*dt*vertViscTopOfEdge(k+1,iEdge) &
+               / (layerThicknessEdge(k,iEdge) + layerThicknessEdge(k+1,iEdge)) &
+               / layerThicknessEdge(k,iEdge)
+         enddo
+
+         ! B is diagonal term
+         B(1) = 1.0_RKIND - C(1) &
+           ! added Rayleigh terms
+           + dt*rayleighDampingCoef/((1.0_RKIND - rayleighDepthVariable) + rayleighDepthVariable*edgeThicknessTotal)
+         do k = 2, N-1
+            B(k) = 1.0_RKIND - A(k) - C(k) &
+              ! added Rayleigh terms
+              + dt*(rayleighDampingCoef/((1.0_RKIND - rayleighDepthVariable) + rayleighDepthVariable*edgeThicknessTotal))
+         enddo
+
+         ! Apply bottom drag boundary condition on the viscous term
+         ! second line uses sqrt(2.0*kineticEnergyEdge(k,iEdge))
+         B(N) = 1.0_RKIND - A(N) + dt*implicitBottomDragCoef &
+              * sqrt(kineticEnergyCell(N,cell1) + kineticEnergyCell(N,cell2)) / layerThicknessEdge(N,iEdge) &
+              ! added Rayleigh terms
+              + dt*(rayleighBottomDampingCoef + &
+                    rayleighDampingCoef /((1.0_RKIND - rayleighDepthVariable) + rayleighDepthVariable*edgeThicknessTotal))
+
+         call tridiagonal_solve(A(2:N),B,C(1:N-1),normalVelocity(:,iEdge),velTemp,N)
+
+         normalVelocity(1:N,iEdge) = velTemp(1:N)
+         normalVelocity(N+1:nVertLevels,iEdge) = 0.0_RKIND
+
+        end if
+      end do
+      !$omp end do
+
+      deallocate(A,B,C,velTemp)
+
+   !--------------------------------------------------------------------
+
+   end subroutine ocn_vel_vmix_tend_implicit_rayleigh!}}}
+
+!***********************************************************************
+!
 !  routine ocn_vel_vmix_tend_implicit
 !
 !> \brief   Computes tendencies for implicit momentum vertical mixing
@@ -271,9 +426,9 @@ contains
       nEdges = nEdgesArray( 1 )
 
       allocate(A(nVertLevels),B(nVertLevels),C(nVertLevels),velTemp(nVertLevels))
-      A(1)=0
+      A(1)=0.0_RKIND
 
-      !$omp do schedule(runtime) private(N, cell1, cell2, k)
+      !$omp do schedule(runtime)
       do iEdge = 1, nEdges
         N = maxLevelEdgeTop(iEdge)
         if (N .gt. 0) then
@@ -302,15 +457,15 @@ contains
          enddo
 
          ! B is diagonal term
-         B(1) = 1 - C(1)
+         B(1) = 1.0_RKIND - C(1)
          do k = 2, N-1
-            B(k) = 1 - A(k) - C(k)
+            B(k) = 1.0_RKIND - A(k) - C(k)
          enddo
 
          ! Apply bottom drag boundary condition on the viscous term
          ! second line uses sqrt(2.0*kineticEnergyEdge(k,iEdge))
-         B(N) = 1 - A(N) + dt*implicitBottomDragCoef &
-              * sqrt(kineticEnergyCell(k,cell1) + kineticEnergyCell(k,cell2)) / layerThicknessEdge(k,iEdge)
+         B(N) = 1.0_RKIND - A(N) + dt*implicitBottomDragCoef &
+              * sqrt(kineticEnergyCell(N,cell1) + kineticEnergyCell(N,cell2)) / layerThicknessEdge(N,iEdge)
 
          call tridiagonal_solve(A(2:N),B,C(1:N-1),normalVelocity(:,iEdge),velTemp,N)
 
@@ -326,6 +481,461 @@ contains
    !--------------------------------------------------------------------
 
    end subroutine ocn_vel_vmix_tend_implicit!}}}
+
+!***********************************************************************
+!
+!  routine ocn_vel_vmix_tend_implicit_variable
+!
+!> \brief   Computes tendencies for implicit momentum vertical mixing
+!>          with spatially-variable bottom drag
+!> \author  Mark Petersen, Phillip J. Wolfram
+!> \date    September 2011, September 2019
+!> \details
+!>  This routine computes the tendencies for implicit vertical mixing for momentum
+!>  using computed coefficients from spatially-variable bottom drag.
+!>  Except for bottom drag coefficient, routine should be identifcal to
+!>  ocn_vel_vmix_tend_implicit above.
+!
+!-----------------------------------------------------------------------
+
+   subroutine ocn_vel_vmix_tend_implicit_spatially_variable(meshPool, bottomDrag, dt, kineticEnergyCell, & !{{{
+                                         vertViscTopOfEdge, layerThickness, &
+                                         layerThicknessEdge, normalVelocity, err)
+
+      !-----------------------------------------------------------------
+      !
+      ! input variables
+      !
+      !-----------------------------------------------------------------
+
+      type (mpas_pool_type), intent(in) :: &
+         meshPool          !< Input: mesh information
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         kineticEnergyCell        !< Input: kinetic energy at cell
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         vertViscTopOfEdge !< Input: vertical mixing coefficients
+
+      real (kind=RKIND), intent(in) :: &
+         dt            !< Input: time step
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         layerThickness !< Input: thickness at cell center
+
+       real (kind=RKIND), dimension(:), intent(in) :: &
+         bottomDrag !< Input: bottomDrag at cell centeres
+
+      !-----------------------------------------------------------------
+      !
+      ! input/output variables
+      !
+      !-----------------------------------------------------------------
+
+      real (kind=RKIND), dimension(:,:), intent(inout) :: &
+         normalVelocity             !< Input: velocity
+
+      real (kind=RKIND), dimension(:,:), intent(inout) :: &
+         layerThicknessEdge        !< Input: thickness at edge
+
+      !-----------------------------------------------------------------
+      !
+      ! output variables
+      !
+      !-----------------------------------------------------------------
+
+      integer, intent(out) :: err !< Output: error flag
+
+      !-----------------------------------------------------------------
+      !
+      ! local variables
+      !
+      !-----------------------------------------------------------------
+
+      integer :: iEdge, k, cell1, cell2, N, nEdges
+      integer, pointer :: nVertLevels
+      real (kind=RKIND) :: implicitCd
+      integer, dimension(:), pointer :: nEdgesArray
+
+      integer, dimension(:), pointer :: maxLevelEdgeTop
+
+      integer, dimension(:,:), pointer :: cellsOnEdge
+
+      real (kind=RKIND), dimension(:), allocatable :: A, B, C, velTemp
+
+      err = 0
+
+      if(.not.velVmixOn) return
+
+      call mpas_pool_get_dimension(meshPool, 'nEdgesArray', nEdgesArray)
+      call mpas_pool_get_dimension(meshPool, 'nVertLevels', nVertLevels)
+
+      call mpas_pool_get_array(meshPool, 'maxLevelEdgeTop', maxLevelEdgeTop)
+      call mpas_pool_get_array(meshPool, 'cellsOnEdge', cellsOnEdge)
+
+      nEdges = nEdgesArray( 1 )
+
+      allocate(A(nVertLevels),B(nVertLevels),C(nVertLevels),velTemp(nVertLevels))
+      A(1)=0.0_RKIND
+
+      !$omp do schedule(runtime)
+      do iEdge = 1, nEdges
+        N = maxLevelEdgeTop(iEdge)
+        if (N .gt. 0) then
+
+         ! Compute A(k), B(k), C(k)
+         ! layerThicknessEdge is computed in compute_solve_diag, and is not available yet,
+         ! so recompute layerThicknessEdge here.
+         cell1 = cellsOnEdge(1,iEdge)
+         cell2 = cellsOnEdge(2,iEdge)
+         do k = 1, N
+            layerThicknessEdge(k,iEdge) = 0.5_RKIND * (layerThickness(k,cell1) + layerThickness(k,cell2))
+         end do
+
+         ! average cell-based implicit bottom drag to edges
+         implicitCd = 0.5_RKIND*(bottomDrag(cell1) + bottomDrag(cell2))
+
+         ! A is lower diagonal term
+         do k = 2, N
+            A(k) = -2.0_RKIND*dt*vertViscTopOfEdge(k,iEdge) &
+               / (layerThicknessEdge(k-1,iEdge) + layerThicknessEdge(k,iEdge)) &
+               / layerThicknessEdge(k,iEdge)
+         enddo
+
+         ! C is upper diagonal term
+         do k = 1, N-1
+            C(k) = -2.0_RKIND*dt*vertViscTopOfEdge(k+1,iEdge) &
+               / (layerThicknessEdge(k,iEdge) + layerThicknessEdge(k+1,iEdge)) &
+               / layerThicknessEdge(k,iEdge)
+         enddo
+
+         ! B is diagonal term
+         B(1) = 1.0_RKIND - C(1)
+         do k = 2, N-1
+            B(k) = 1.0_RKIND - A(k) - C(k)
+         enddo
+
+         ! Apply bottom drag boundary condition on the viscous term
+         ! second line uses sqrt(2.0*kineticEnergyEdge(k,iEdge))
+         ! use implicitCd from spatially variable bottom drag
+         B(N) = 1.0_RKIND - A(N) + dt*implicitCd &
+              * sqrt(kineticEnergyCell(N,cell1) + kineticEnergyCell(N,cell2)) / layerThicknessEdge(N,iEdge)
+
+         call tridiagonal_solve(A(2:N),B,C(1:N-1),normalVelocity(:,iEdge),velTemp,N)
+
+         normalVelocity(1:N,iEdge) = velTemp(1:N)
+         normalVelocity(N+1:nVertLevels,iEdge) = 0.0_RKIND
+
+        end if
+      end do
+      !$omp end do
+
+      deallocate(A,B,C,velTemp)
+
+   !--------------------------------------------------------------------
+
+   end subroutine ocn_vel_vmix_tend_implicit_spatially_variable!}}}
+
+
+!***********************************************************************
+!
+!  routine ocn_vel_vmix_tend_implicit_variable_mannings
+!
+!> \brief   Computes tendencies for implicit momentum vertical mixing
+!>          with spatially-variable bottom drag using Mannings friction
+!> \author  Mark Petersen, Phillip J. Wolfram
+!> \date    September 2011, September 2019
+!> \details
+!>  This routine computes the tendencies for implicit vertical mixing for momentum
+!>  using computed coefficients from spatially-variable bottom drag.
+!>  Except for bottom drag coefficient, routine should be identifcal to
+!>  ocn_vel_vmix_tend_implicit above.  Cd uses Mannings' n values for the
+!>  Cd=g*n^2*h^{-1/3}.
+!
+!-----------------------------------------------------------------------
+
+   subroutine ocn_vel_vmix_tend_implicit_spatially_variable_mannings(meshPool, bottomDrag, dt, kineticEnergyCell, & !{{{
+                                         vertViscTopOfEdge, layerThickness, &
+                                         layerThicknessEdge, normalVelocity, ssh, bottomDepth, err)
+
+      !-----------------------------------------------------------------
+      !
+      ! input variables
+      !
+      !-----------------------------------------------------------------
+
+      type (mpas_pool_type), intent(in) :: &
+         meshPool          !< Input: mesh information
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         kineticEnergyCell        !< Input: kinetic energy at cell
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         vertViscTopOfEdge !< Input: vertical mixing coefficients
+
+      real (kind=RKIND), intent(in) :: &
+         dt            !< Input: time step
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         layerThickness !< Input: thickness at cell center
+
+       real (kind=RKIND), dimension(:), intent(in) :: &
+         bottomDrag !< Input: bottomDrag at cell centeres
+
+       real (kind=RKIND), dimension(:), pointer :: ssh
+
+       real (kind=RKIND), dimension(:), pointer :: bottomDepth
+
+      !-----------------------------------------------------------------
+      !
+      ! input/output variables
+      !
+      !-----------------------------------------------------------------
+
+      real (kind=RKIND), dimension(:,:), intent(inout) :: &
+         normalVelocity             !< Input: velocity
+
+      real (kind=RKIND), dimension(:,:), intent(inout) :: &
+         layerThicknessEdge        !< Input: thickness at edge
+
+      !-----------------------------------------------------------------
+      !
+      ! output variables
+      !
+      !-----------------------------------------------------------------
+
+      integer, intent(out) :: err !< Output: error flag
+
+      !-----------------------------------------------------------------
+      !
+      ! local variables
+      !
+      !-----------------------------------------------------------------
+
+      integer :: iEdge, k, cell1, cell2, N, nEdges
+      integer, pointer :: nVertLevels
+      real (kind=RKIND) :: implicitCd
+      integer, dimension(:), pointer :: nEdgesArray
+
+      integer, dimension(:), pointer :: maxLevelEdgeTop
+
+      integer, dimension(:,:), pointer :: cellsOnEdge
+
+      real (kind=RKIND), dimension(:), allocatable :: A, B, C, velTemp
+
+      err = 0
+
+      if(.not.velVmixOn) return
+
+      call mpas_pool_get_dimension(meshPool, 'nEdgesArray', nEdgesArray)
+      call mpas_pool_get_dimension(meshPool, 'nVertLevels', nVertLevels)
+
+      call mpas_pool_get_array(meshPool, 'maxLevelEdgeTop', maxLevelEdgeTop)
+      call mpas_pool_get_array(meshPool, 'cellsOnEdge', cellsOnEdge)
+
+      nEdges = nEdgesArray( 1 )
+
+      allocate(A(nVertLevels),B(nVertLevels),C(nVertLevels),velTemp(nVertLevels))
+      A(1)=0.0_RKIND
+
+      !$omp do schedule(runtime)
+      do iEdge = 1, nEdges
+        N = maxLevelEdgeTop(iEdge)
+        if (N .gt. 0) then
+
+         ! Compute A(k), B(k), C(k)
+         ! layerThicknessEdge is computed in compute_solve_diag, and is not available yet,
+         ! so recompute layerThicknessEdge here.
+         cell1 = cellsOnEdge(1,iEdge)
+         cell2 = cellsOnEdge(2,iEdge)
+         do k = 1, N
+            layerThicknessEdge(k,iEdge) = 0.5_RKIND * (layerThickness(k,cell1) + layerThickness(k,cell2))
+         end do
+
+         ! average cell-based implicit bottom drag to edges and convert Mannings n to Cd
+         implicitCd = gravity*(0.5_RKIND*(bottomDrag(cell1) + bottomDrag(cell2)))**2.0 * &
+          (0.5_RKIND * (ssh(cell1) + ssh(cell2) + bottomDepth(cell1) + bottomDepth(cell2)))**(-1.0_RKIND/3.0_RKIND)
+
+         ! A is lower diagonal term
+         do k = 2, N
+            A(k) = -2.0_RKIND*dt*vertViscTopOfEdge(k,iEdge) &
+               / (layerThicknessEdge(k-1,iEdge) + layerThicknessEdge(k,iEdge)) &
+               / layerThicknessEdge(k,iEdge)
+         enddo
+
+         ! C is upper diagonal term
+         do k = 1, N-1
+            C(k) = -2.0_RKIND*dt*vertViscTopOfEdge(k+1,iEdge) &
+               / (layerThicknessEdge(k,iEdge) + layerThicknessEdge(k+1,iEdge)) &
+               / layerThicknessEdge(k,iEdge)
+         enddo
+
+         ! B is diagonal term
+         B(1) = 1.0_RKIND - C(1)
+         do k = 2, N-1
+            B(k) = 1.0_RKIND - A(k) - C(k)
+         enddo
+
+         ! Apply bottom drag boundary condition on the viscous term
+         ! second line uses sqrt(2.0*kineticEnergyEdge(k,iEdge))
+         ! use implicitCd from spatially variable bottom drag
+         B(N) = 1.0_RKIND - A(N) + dt*implicitCd &
+              * sqrt(kineticEnergyCell(N,cell1) + kineticEnergyCell(N,cell2)) / layerThicknessEdge(N,iEdge)
+
+         call tridiagonal_solve(A(2:N),B,C(1:N-1),normalVelocity(:,iEdge),velTemp,N)
+
+         normalVelocity(1:N,iEdge) = velTemp(1:N)
+         normalVelocity(N+1:nVertLevels,iEdge) = 0.0_RKIND
+
+        end if
+      end do
+      !$omp end do
+
+      deallocate(A,B,C,velTemp)
+
+   !--------------------------------------------------------------------
+
+   end subroutine ocn_vel_vmix_tend_implicit_spatially_variable_mannings!}}}
+!!Nairita
+        subroutine ocn_vel_vmix_tend_implicit_spatially_variable_roughness(meshPool, bottomDrag, dt,kineticEnergyCell, & !{{{
+        vertViscTopOfEdge, layerThickness, &
+        layerThicknessEdge, normalVelocity,ssh, bottomDepth, err)
+        ! input variables
+      !
+      !-----------------------------------------------------------------
+
+      type (mpas_pool_type), intent(in) :: &
+         meshPool          !< Input: mesh information
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         kineticEnergyCell        !< Input: kinetic energy at cell
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         vertViscTopOfEdge !< Input: vertical mixing coefficients
+
+      real (kind=RKIND), intent(in) :: &
+         dt            !< Input: time step
+
+      real (kind=RKIND), dimension(:,:), intent(in) :: &
+         layerThickness !< Input: thickness at cell center
+
+       real (kind=RKIND), dimension(:), intent(in) :: &
+         bottomDrag !< Input: bottomDrag at cell centeres
+
+        real (kind=RKIND), dimension(:), pointer :: ssh
+
+       real (kind=RKIND), dimension(:), pointer :: bottomDepth
+
+      !-----------------------------------------------------------------
+      !
+      ! input/output variables
+      !
+      !-----------------------------------------------------------------
+
+      real (kind=RKIND), dimension(:,:), intent(inout) :: &
+         normalVelocity             !< Input: velocity
+
+      real (kind=RKIND), dimension(:,:), intent(inout) :: &
+         layerThicknessEdge        !< Input: thickness at edge
+
+      !-----------------------------------------------------------------
+      !
+      ! output variables
+        
+        integer, intent(out) :: err !< Output: error flag
+
+      !-----------------------------------------------------------------
+      !
+      ! local variables
+      !
+      !-----------------------------------------------------------------
+
+      integer :: iEdge, k, cell1, cell2, N, nEdges
+      integer, pointer :: nVertLevels
+      real (kind=RKIND) :: implicitCd
+      integer, dimension(:), pointer :: nEdgesArray
+
+      integer, dimension(:), pointer :: maxLevelEdgeTop
+
+      integer, dimension(:,:), pointer :: cellsOnEdge
+
+      real (kind=RKIND), dimension(:), allocatable :: A, B, C, velTemp
+        
+        err = 0
+
+      if(.not.velVmixOn) return
+
+      call mpas_pool_get_dimension(meshPool, 'nEdgesArray', nEdgesArray)
+      call mpas_pool_get_dimension(meshPool, 'nVertLevels', nVertLevels)
+
+      call mpas_pool_get_array(meshPool, 'maxLevelEdgeTop', maxLevelEdgeTop)
+      call mpas_pool_get_array(meshPool, 'cellsOnEdge', cellsOnEdge)
+
+      nEdges = nEdgesArray( 1 )
+
+      allocate(A(nVertLevels),B(nVertLevels),C(nVertLevels),velTemp(nVertLevels))
+      A(1)=0.0_RKIND
+
+      !$omp do schedule(runtime)
+      do iEdge = 1, nEdges
+        N = maxLevelEdgeTop(iEdge)
+        if (N .gt. 0) then
+        ! Compute A(k), B(k), C(k)
+         ! layerThicknessEdge is computed in compute_solve_diag, and is not
+         ! available yet,
+         ! so recompute layerThicknessEdge here.
+         cell1 = cellsOnEdge(1,iEdge)
+         cell2 = cellsOnEdge(2,iEdge)
+         do k = 1, N
+         layerThicknessEdge(k,iEdge) = 0.5_RKIND * (layerThickness(k,cell1) &
+         +layerThickness(k,cell2))
+         end do
+
+         ! average cell-based implicit bottom drag to edges and convert Mannings
+         ! n to Cd
+        implicitCd =max(0.0025,0.16/log(0.5*0.5*((bottomDepth(cell1)+bottomDepth(cell2))/0.001)**2.0))        
+         if((implicitCd.ge.0.1).or.(implicitCd.le.0.0001))then
+        implicitCd=0.0025
+        endif
+
+        ! A is lower diagonal term
+        do k = 2, N
+            A(k) = -2.0_RKIND*dt*vertViscTopOfEdge(k,iEdge) &
+               / (layerThicknessEdge(k-1,iEdge) + layerThicknessEdge(k,iEdge)) &
+               / layerThicknessEdge(k,iEdge)
+         enddo
+
+         ! C is upper diagonal term
+         do k = 1, N-1
+            C(k) = -2.0_RKIND*dt*vertViscTopOfEdge(k+1,iEdge) &
+               / (layerThicknessEdge(k,iEdge) + layerThicknessEdge(k+1,iEdge)) &
+               / layerThicknessEdge(k,iEdge)
+         enddo
+
+         ! B is diagonal term
+         B(1) = 1.0_RKIND - C(1)
+         do k = 2, N-1
+            B(k) = 1.0_RKIND - A(k) - C(k)
+         enddo
+        ! Apply bottom drag boundary condition on the viscous term
+         ! second line uses sqrt(2.0*kineticEnergyEdge(k,iEdge))
+         ! use implicitCd from spatially variable bottom drag
+         B(N) = 1.0_RKIND - A(N) + dt*implicitCd &
+              * sqrt(kineticEnergyCell(N,cell1) + kineticEnergyCell(N,cell2)) &
+         /layerThicknessEdge(N,iEdge)
+
+         call tridiagonal_solve(A(2:N),B,C(1:N-1),normalVelocity(:,iEdge),velTemp,N)
+
+         normalVelocity(1:N,iEdge) = velTemp(1:N)
+         normalVelocity(N+1:nVertLevels,iEdge) = 0.0_RKIND
+
+        end if
+      end do
+      !$omp end do
+
+      deallocate(A,B,C,velTemp)
+
+        end subroutine
 
 !***********************************************************************
 !
@@ -415,13 +1025,13 @@ contains
       nCells = nCellsArray( 1 )
 
       call mpas_timer_start('vmix tracers tend imp loop', .false.)
-      !$omp do schedule(runtime) private(N, k)
+      !$omp do schedule(runtime)
       do iCell = 1, nCells
          ! Compute A(k), B(k), C(k) for tracers
          N = maxLevelCell(iCell)
 
          ! A is lower diagonal term
-         A(1)=0
+         A(1)=0.0_RKIND
          do k = 2, N
             A(k) = -2.0_RKIND*dt*vertDiffTopOfCell(k,iCell) &
                  / (layerThickness(k-1,iCell) + layerThickness(k,iCell)) / layerThickness(k,iCell)
@@ -436,7 +1046,7 @@ contains
 
          ! B is diagonal term
          do k = 1, N
-            B(k) = 1 - A(k) - C(k)
+            B(k) = 1.0_RKIND - A(k) - C(k)
          enddo
 
          if ( config_cvmix_kpp_nonlocal_with_implicit_mix ) then
@@ -490,6 +1100,7 @@ contains
 
       integer :: iCell, timeLevel, k, cell1, cell2, iEdge, nCells, nEdges
       integer, dimension(:), pointer :: nCellsArray, nEdgesArray
+      real (kind=RKIND), dimension(:), pointer :: bottomDrag, ssh, bottomDepth   ! needed for depth-variable computation
       real (kind=RKIND), dimension(:,:), pointer :: normalVelocity, layerThickness, layerThicknessEdge, vertViscTopOfEdge, &
                                                     vertDiffTopOfCell, kineticEnergyCell
       real (kind=RKIND), dimension(:,:), pointer :: vertViscTopOfCell, nonLocalSurfaceTracerFlux, tracerGroupSurfaceFlux
@@ -500,6 +1111,9 @@ contains
       integer, dimension(:,:), pointer :: cellsOnEdge
       logical, pointer :: config_use_cvmix,config_compute_active_tracer_budgets
       logical, pointer :: config_cvmix_kpp_nonlocal_with_implicit_mix
+      logical, pointer :: config_Rayleigh_friction, config_Rayleigh_bottom_friction, &
+                          config_Rayleigh_damping_depth_variable
+      logical, pointer :: config_use_implicit_bottom_drag_variable, config_use_implicit_bottom_drag_variable_mannings,config_use_implicit_bottom_roughness
 
       type (mpas_pool_iterator_type) :: groupItr
 
@@ -523,8 +1137,24 @@ contains
                                 config_cvmix_kpp_nonlocal_with_implicit_mix)
       call mpas_pool_get_config(ocnConfigs, 'config_compute_active_tracer_budgets',  &
                                 config_compute_active_tracer_budgets)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_friction', &
+                                             config_Rayleigh_friction)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_bottom_friction', &
+                                             config_Rayleigh_bottom_friction)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_damping_depth_variable', &
+                                             config_Rayleigh_damping_depth_variable)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_damping_depth_variable', &
+                                             config_Rayleigh_damping_depth_variable)
+      call mpas_pool_get_config(ocnConfigs, 'config_use_implicit_bottom_drag_variable', &
+                                             config_use_implicit_bottom_drag_variable)
+      call mpas_pool_get_config(ocnConfigs, 'config_use_implicit_bottom_drag_variable_mannings', &
+                                             config_use_implicit_bottom_drag_variable_mannings)
+        call mpas_pool_get_config(ocnConfigs,&
+'config_use_implicit_bottom_roughness', &
+                                             config_use_implicit_bottom_roughness)
       call mpas_pool_get_array(statePool, 'normalVelocity', normalVelocity, timeLevel)
       call mpas_pool_get_array(statePool, 'layerThickness', layerThickness, timeLevel)
+      call mpas_pool_get_array(statePool, 'ssh', ssh, timeLevel)
 
       call mpas_pool_get_array(diagnosticsPool, 'kineticEnergyCell', kineticEnergyCell)
       call mpas_pool_get_array(diagnosticsPool, 'layerThicknessEdge', layerThicknessEdge)
@@ -537,10 +1167,13 @@ contains
       call mpas_pool_get_array(meshPool, 'maxLevelCell', maxLevelCell)
       call mpas_pool_get_array(meshPool, 'maxLevelEdgeTop', maxLevelEdgeTop)
       call mpas_pool_get_array(meshPool, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(meshPool, 'bottomDepth', bottomDepth)
 
       call mpas_pool_get_dimension(meshPool, 'nVertLevels', nVertLevels)
       call mpas_pool_get_dimension(meshPool, 'nCellsArray', nCellsArray)
       call mpas_pool_get_dimension(meshPool, 'nEdgesArray', nEdgesArray)
+
+      call mpas_pool_get_array(forcingPool, 'bottomDrag', bottomDrag)
 
       call mpas_timer_start('vmix coefs', .false.)
       call ocn_vmix_coefs(meshPool, statePool, forcingPool, diagnosticsPool, scratchPool, err, timeLevel)
@@ -570,8 +1203,36 @@ contains
       !  Implicit vertical solve for momentum
       !
       call mpas_timer_start('vmix solve momentum', .false.)
-      call ocn_vel_vmix_tend_implicit(meshPool, dt, kineticEnergyCell, vertViscTopOfEdge, layerThickness, layerThicknessEdge, &
-                                      normalVelocity, err)
+      if (.not. (config_Rayleigh_friction .or. &
+                 config_Rayleigh_bottom_friction .or. &
+                 config_Rayleigh_damping_depth_variable .or. &
+                 config_use_implicit_bottom_drag_variable .or. &
+                 config_use_implicit_bottom_drag_variable_mannings.or.&
+                 config_use_implicit_bottom_roughness)) then
+        call ocn_vel_vmix_tend_implicit(meshPool, dt, kineticEnergyCell, &
+          vertViscTopOfEdge, layerThickness, layerThicknessEdge, normalVelocity, err)
+      else
+        if (config_use_implicit_bottom_drag_variable) then
+          call ocn_vel_vmix_tend_implicit_spatially_variable(meshPool, bottomDrag, dt, kineticEnergyCell, &
+            vertViscTopOfEdge, layerThickness, layerThicknessEdge, normalVelocity, err)
+        else if (config_use_implicit_bottom_drag_variable_mannings) then
+          ! update bottomDrag via Cd=g*n^2*h^(-1/3)
+          call ocn_vel_vmix_tend_implicit_spatially_variable_mannings(meshPool, bottomDrag, &
+            dt, kineticEnergyCell, &
+            vertViscTopOfEdge, layerThickness, layerThicknessEdge, normalVelocity, &
+            ssh, bottomDepth, err)
+        else if (config_use_implicit_bottom_roughness) then
+          ! update bottomDrag via Cd=g*n^2*h^(-1/3)
+          call ocn_vel_vmix_tend_implicit_spatially_variable_roughness( &
+        meshPool,bottomDrag, &
+            dt, kineticEnergyCell, &
+            vertViscTopOfEdge, layerThickness, layerThicknessEdge, &
+        normalVelocity, ssh, bottomDepth, err)
+        else if (config_Rayleigh_damping_depth_variable) then
+          call ocn_vel_vmix_tend_implicit_rayleigh(meshPool, dt, kineticEnergyCell, &
+            vertViscTopOfEdge, layerThickness, layerThicknessEdge, normalVelocity, err)
+        end if
+      end if
       call mpas_timer_stop('vmix solve momentum')
 
       !
@@ -661,6 +1322,9 @@ contains
       logical, pointer :: config_disable_vel_vmix, config_disable_tr_vmix
       logical, pointer :: config_use_implicit_bottom_drag
       real (kind=RKIND), pointer :: config_implicit_bottom_drag_coeff
+      logical, pointer :: config_Rayleigh_friction, config_Rayleigh_bottom_friction, &
+                          config_Rayleigh_damping_depth_variable
+      real (kind=RKIND), pointer :: config_Rayleigh_damping_coeff, config_Rayleigh_bottom_damping_coeff
 
       err = 0
 
@@ -668,6 +1332,33 @@ contains
       call mpas_pool_get_config(ocnConfigs, 'config_disable_tr_vmix', config_disable_tr_vmix)
       call mpas_pool_get_config(ocnConfigs, 'config_use_implicit_bottom_drag', config_use_implicit_bottom_drag)
       call mpas_pool_get_config(ocnConfigs, 'config_implicit_bottom_drag_coeff', config_implicit_bottom_drag_coeff)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_friction', &
+                                             config_Rayleigh_friction)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_bottom_friction', &
+                                             config_Rayleigh_bottom_friction)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_damping_coeff', &
+                                             config_Rayleigh_damping_coeff)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_damping_depth_variable', &
+                                             config_Rayleigh_damping_depth_variable)
+      call mpas_pool_get_config(ocnConfigs, 'config_Rayleigh_bottom_damping_coeff', &
+                                             config_Rayleigh_bottom_damping_coeff)
+
+      rayleighDampingCoef = 0.0_RKIND
+
+      if (config_Rayleigh_friction) then
+          rayleighDampingCoef = config_Rayleigh_damping_coeff
+      endif
+
+      rayleighBottomDampingCoef = 0.0_RKIND
+
+      if (config_Rayleigh_bottom_friction) then
+          rayleighBottomDampingCoef = config_Rayleigh_bottom_damping_coeff
+      endif
+
+      rayleighDepthVariable = 0.0_RKIND
+      if (config_Rayleigh_damping_depth_variable) then
+        rayleighDepthVariable = 1.0_RKIND
+      end if
 
       velVmixOn = .true.
       tracerVmixOn = .true.
